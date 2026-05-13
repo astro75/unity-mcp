@@ -1,4 +1,5 @@
 using System;
+using System.Threading;
 using System.Threading.Tasks;
 using MCPForUnity.Editor.Constants;
 using MCPForUnity.Editor.Helpers;
@@ -24,18 +25,38 @@ namespace MCPForUnity.Editor.Services
             TimeSpan.FromSeconds(30)
         };
 
+        // After the bounded schedule above is exhausted, keep retrying at this interval
+        // until cancelled. Mirrors WebSocketTransportClient.ReconnectTailInterval so the
+        // reload path is as durable as the steady-state reconnect path.
+        private static readonly TimeSpan ResumeTailInterval = TimeSpan.FromSeconds(30);
+
+        private static CancellationTokenSource s_resumeCts;
+
+        /// <summary>
+        /// True while a post-reload resume cycle (initial schedule or tail retry) is in
+        /// flight. The connection UI reads this to show "Resuming..." instead of
+        /// "No Session" while the bridge is still attempting to reconnect.
+        /// </summary>
+        public static bool IsResuming => s_resumeCts != null;
+
         static HttpBridgeReloadHandler()
         {
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             AssemblyReloadEvents.afterAssemblyReload += OnAfterAssemblyReload;
+            EditorApplication.quitting += CancelActiveResume;
         }
 
         private static void OnBeforeAssemblyReload()
         {
             try
             {
-                var transport = MCPServiceLocator.TransportManager;
-                bool shouldResume = transport.IsRunning(TransportMode.Http);
+                // A new reload owns the next resume cycle; stop any in-flight tail retry
+                // from a previous reload so it doesn't race the new client instance.
+                CancelActiveResume();
+
+                bool useHttp = EditorConfigurationCache.Instance.UseHttpTransport;
+                bool userStopped = SessionState.GetBool(SessionStateKeys.HttpUserStopped, false);
+                bool shouldResume = useHttp && !userStopped;
 
                 if (shouldResume)
                 {
@@ -46,10 +67,13 @@ namespace MCPForUnity.Editor.Services
                     EditorPrefs.DeleteKey(EditorPrefKeys.ResumeHttpAfterReload);
                 }
 
-                if (shouldResume)
+                var transport = MCPServiceLocator.TransportManager;
+                if (transport.GetClient(TransportMode.Http) != null)
                 {
                     // beforeAssemblyReload is synchronous; force a synchronous teardown so we do not
                     // leave an orphaned socket due to an unfinished async close handshake.
+                    // We tear down whenever a client exists, not only when "running", so transient
+                    // mid-reconnect states cannot leak sockets across the reload boundary.
                     transport.ForceStop(TransportMode.Http);
                 }
             }
@@ -64,9 +88,12 @@ namespace MCPForUnity.Editor.Services
             bool resume = false;
             try
             {
-                // Only resume HTTP if it is still the selected transport.
+                // Honor the user's transport choice and "I explicitly stopped" intent.
                 bool useHttp = EditorConfigurationCache.Instance.UseHttpTransport;
-                resume = useHttp && EditorPrefs.GetBool(EditorPrefKeys.ResumeHttpAfterReload, false);
+                bool userStopped = SessionState.GetBool(SessionStateKeys.HttpUserStopped, false);
+                resume = useHttp
+                         && !userStopped
+                         && EditorPrefs.GetBool(EditorPrefKeys.ResumeHttpAfterReload, false);
                 if (resume)
                 {
                     EditorPrefs.DeleteKey(EditorPrefKeys.ResumeHttpAfterReload);
@@ -83,80 +110,148 @@ namespace MCPForUnity.Editor.Services
                 return;
             }
 
-            // If the editor is not compiling, attempt an immediate restart without relying on editor focus.
-            bool isCompiling = EditorApplication.isCompiling;
-            try
-            {
-                var pipeline = Type.GetType("UnityEditor.Compilation.CompilationPipeline, UnityEditor");
-                var prop = pipeline?.GetProperty("isCompiling", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
-                if (prop != null) isCompiling |= (bool)prop.GetValue(null);
-            }
-            catch { }
-
-            if (!isCompiling)
-            {
-                _ = ResumeHttpWithRetriesAsync();
-                return;
-            }
-
-            // Fallback when compiling: schedule on the editor loop
-            EditorApplication.delayCall += () =>
-            {
-                _ = ResumeHttpWithRetriesAsync();
-            };
+            // Schedule on the editor loop so we don't fight asset import / shader compile
+            // immediately after the domain reload settles.
+            var cts = new CancellationTokenSource();
+            s_resumeCts = cts;
+            EditorApplication.delayCall += () => _ = RunResumeAsync(cts);
         }
 
-        private static async Task ResumeHttpWithRetriesAsync()
+        private static async Task RunResumeAsync(CancellationTokenSource cts)
         {
-            Exception lastException = null;
+            try
+            {
+                await ResumeHttpWithRetriesAsync(cts.Token).ConfigureAwait(false);
+            }
+            finally
+            {
+                if (s_resumeCts == cts) s_resumeCts = null;
+                try { cts.Dispose(); } catch { }
+            }
+        }
+
+        private static void CancelActiveResume()
+        {
+            CancellationTokenSource cts = s_resumeCts;
+            s_resumeCts = null;
+            if (cts == null) return;
+            // Don't Dispose here: the resume task may still observe the token. The task's
+            // finally block disposes the CTS once it has finished using it.
+            try { cts.Cancel(); } catch { }
+        }
+
+        private static async Task WaitForEditorIdleAsync(CancellationToken token)
+        {
+            // Wait until the editor is no longer compiling or importing assets before the
+            // first connect attempt. Bounded so we never block forever — if the editor is
+            // genuinely busy for a long time, fall through and rely on the retry loop.
+            DateTime deadline = DateTime.UtcNow + TimeSpan.FromSeconds(15);
+            while (!token.IsCancellationRequested && DateTime.UtcNow < deadline)
+            {
+                bool busy = EditorApplication.isCompiling || EditorApplication.isUpdating;
+                try
+                {
+                    var pipeline = Type.GetType("UnityEditor.Compilation.CompilationPipeline, UnityEditor");
+                    var prop = pipeline?.GetProperty("isCompiling", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static);
+                    if (prop != null) busy |= (bool)prop.GetValue(null);
+                }
+                catch { }
+
+                if (!busy) return;
+
+                try { await Task.Delay(TimeSpan.FromMilliseconds(250), token).ConfigureAwait(false); }
+                catch { return; }
+            }
+        }
+
+        private static async Task ResumeHttpWithRetriesAsync(CancellationToken token)
+        {
+            await WaitForEditorIdleAsync(token).ConfigureAwait(false);
+            if (token.IsCancellationRequested) return;
 
             for (int i = 0; i < ResumeRetrySchedule.Length; i++)
             {
-                int attempt = i + 1;
-                McpLog.Debug($"[HTTP Reload] Resume attempt {attempt}/{ResumeRetrySchedule.Length}");
+                if (token.IsCancellationRequested) return;
 
+                int attempt = i + 1;
                 TimeSpan delay = ResumeRetrySchedule[i];
                 if (delay > TimeSpan.Zero)
                 {
                     McpLog.Debug($"[HTTP Reload] Waiting {delay.TotalSeconds:0.#}s before resume attempt {attempt}");
-                    try { await Task.Delay(delay); }
+                    try { await Task.Delay(delay, token).ConfigureAwait(false); }
                     catch { return; }
                 }
 
-                // Abort retries if the user switched transports while we were waiting.
-                if (!EditorConfigurationCache.Instance.UseHttpTransport)
+                McpLog.Debug($"[HTTP Reload] Resume attempt {attempt}/{ResumeRetrySchedule.Length}");
+
+                if (ShouldAbortResume()) return;
+
+                if (await TryStartAsync(token).ConfigureAwait(false))
                 {
+                    McpLog.Debug($"[HTTP Reload] Resume succeeded on attempt {attempt}");
                     return;
                 }
 
-                try
-                {
-                    bool started = await MCPServiceLocator.TransportManager.StartAsync(TransportMode.Http);
-                    if (started)
-                    {
-                        McpLog.Debug($"[HTTP Reload] Resume succeeded on attempt {attempt}");
-                        MCPForUnityEditorWindow.RequestHealthVerification();
-                        return;
-                    }
-
-                    var state = MCPServiceLocator.TransportManager.GetState(TransportMode.Http);
-                    string reason = string.IsNullOrWhiteSpace(state?.Error) ? "no error detail" : state.Error;
-                    McpLog.Debug($"[HTTP Reload] Resume attempt {attempt} failed: {reason}");
-                }
-                catch (Exception ex)
-                {
-                    lastException = ex;
-                    McpLog.Debug($"[HTTP Reload] Resume attempt {attempt} threw: {ex.Message}");
-                }
+                var state = MCPServiceLocator.TransportManager.GetState(TransportMode.Http);
+                string reason = string.IsNullOrWhiteSpace(state?.Error) ? "no error detail" : state.Error;
+                McpLog.Debug($"[HTTP Reload] Resume attempt {attempt} failed: {reason}");
             }
 
-            if (lastException != null)
+            if (token.IsCancellationRequested) return;
+
+            // Schedule exhausted but we still want HTTP up: tail-retry indefinitely on a
+            // fixed cadence until something cancels us (next reload, user stop, transport
+            // switch, editor quit). Without this the bridge stays dead forever after the
+            // 6 quick attempts, which is the actual user-visible bug.
+            McpLog.Warn($"[HTTP Reload] Initial resume schedule exhausted. Retrying every {ResumeTailInterval.TotalSeconds:0}s until cancelled.");
+
+            while (!token.IsCancellationRequested)
             {
-                McpLog.Warn($"Failed to resume HTTP MCP bridge after domain reload: {lastException.Message}");
+                try { await Task.Delay(ResumeTailInterval, token).ConfigureAwait(false); }
+                catch { return; }
+
+                if (ShouldAbortResume()) return;
+
+                if (await TryStartAsync(token).ConfigureAwait(false))
+                {
+                    McpLog.Info("[HTTP Reload] Tail-retry reconnected to MCP server.");
+                    return;
+                }
             }
-            else
+        }
+
+        /// <summary>
+        /// Returns true if external state says we should stop trying to resume:
+        /// user switched transport away from HTTP, user explicitly stopped, or the
+        /// bridge is already running (something else brought it up).
+        /// </summary>
+        private static bool ShouldAbortResume()
+        {
+            try
             {
-                McpLog.Warn("Failed to resume HTTP MCP bridge after domain reload");
+                if (!EditorConfigurationCache.Instance.UseHttpTransport) return true;
+                if (SessionState.GetBool(SessionStateKeys.HttpUserStopped, false)) return true;
+                if (MCPServiceLocator.TransportManager.IsRunning(TransportMode.Http)) return true;
+            }
+            catch { }
+            return false;
+        }
+
+        private static async Task<bool> TryStartAsync(CancellationToken token)
+        {
+            try
+            {
+                bool started = await MCPServiceLocator.TransportManager.StartAsync(TransportMode.Http).ConfigureAwait(false);
+                if (started && !token.IsCancellationRequested)
+                {
+                    MCPForUnityEditorWindow.RequestHealthVerification();
+                }
+                return started;
+            }
+            catch (Exception ex)
+            {
+                McpLog.Debug($"[HTTP Reload] Resume start threw: {ex.Message}");
+                return false;
             }
         }
     }

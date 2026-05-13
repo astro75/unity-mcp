@@ -373,12 +373,14 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
             }
             else
             {
-                // Check if we're resuming the stdio bridge after a domain reload.
+                // Check if we're resuming the bridge after a domain reload.
                 // During this brief window, show "Resuming..." instead of "No Session" to avoid UI flicker.
                 bool isStdioResuming = stdioSelected
                     && EditorPrefs.GetBool(EditorPrefKeys.ResumeStdioAfterReload, false);
+                bool isHttpResuming = !stdioSelected && HttpBridgeReloadHandler.IsResuming;
+                bool isResuming = isStdioResuming || isHttpResuming;
 
-                if (isStdioResuming)
+                if (isResuming)
                 {
                     connectionStatusLabel.text = "Resuming...";
                     // Keep the indicator in a neutral/transitional state
@@ -430,7 +432,7 @@ namespace MCPForUnity.Editor.Windows.Components.Connection
                     }
                 }
 
-                unityPortField.SetEnabled(!isStdioResuming);
+                unityPortField.SetEnabled(!isResuming);
 
                 int savedPort = EditorPrefs.GetInt(EditorPrefKeys.UnitySocketPort, 0);
                 unityPortField.value = (savedPort == 0

@@ -105,6 +105,12 @@ namespace MCPForUnity.Editor.Services
                 {
                     McpLog.Warn($"Failed to start MCP transport: {mode}");
                 }
+                else if (mode == TransportMode.Http)
+                {
+                    // User (or auto-start) successfully brought HTTP up: clear the
+                    // "user explicitly stopped" intent so future reloads auto-resume.
+                    SessionState.SetBool(SessionStateKeys.HttpUserStopped, false);
+                }
                 return started;
             }
             catch (Exception ex)
@@ -119,6 +125,14 @@ namespace MCPForUnity.Editor.Services
             try
             {
                 var mode = ResolvePreferredMode();
+                if (mode == TransportMode.Http)
+                {
+                    // Reload teardown calls TransportManager.ForceStop directly, so reaching
+                    // BridgeControlService.StopAsync means the stop is user-initiated. Record
+                    // the intent so HttpBridgeReloadHandler does not auto-resume after a
+                    // subsequent domain reload.
+                    SessionState.SetBool(SessionStateKeys.HttpUserStopped, true);
+                }
                 await _transportManager.StopAsync(mode);
             }
             catch (Exception ex)
