@@ -18,6 +18,11 @@ namespace MCPForUnity.Runtime.Helpers
     /// We use reflection rather than direct property access so calls stay clean of
     /// CS0618 warnings AND survive eventual removal of the obsolete property without
     /// a recompile of this package.
+    ///
+    /// When the 3D Physics module is disabled (Unity built-in <c>ENABLE_PHYSICS</c>
+    /// symbol undefined), the 3D accessors are compiled out and return <c>null</c> /
+    /// <c>false</c> / <see cref="SimulationMode.Unknown"/>, matching the existing
+    /// fail-soft contract for missing-API cases.
     /// </summary>
     public static class UnityPhysicsCompat
     {
@@ -87,6 +92,7 @@ namespace MCPForUnity.Runtime.Helpers
         }
 
         // ---------- Physics (3D) ----------
+#if ENABLE_PHYSICS
 
         private static PropertyInfo _physicsAutoSync;
         private static bool _physicsProbed;
@@ -245,6 +251,13 @@ namespace MCPForUnity.Runtime.Helpers
 
             return false;
         }
+
+#else
+        public static bool? GetPhysicsAutoSyncTransforms() => null;
+        public static bool TrySetPhysicsAutoSyncTransforms(bool value) => false;
+        public static SimulationMode GetPhysicsSimulationMode() => SimulationMode.Unknown;
+        public static bool TrySetPhysicsSimulationMode(SimulationMode mode) => false;
+#endif
 
         private static SimulationMode ParseSimulationMode(string s)
         {
