@@ -19,8 +19,9 @@ namespace MCPForUnity.Runtime.Helpers
     /// CS0618 warnings AND survive eventual removal of the obsolete property without
     /// a recompile of this package.
     ///
-    /// When the 3D Physics module is disabled (Unity built-in <c>ENABLE_PHYSICS</c>
-    /// symbol undefined), the 3D accessors are compiled out and return <c>null</c> /
+    /// When the 3D Physics module (<c>com.unity.modules.physics</c>) is absent, the
+    /// asmdef <c>versionDefines</c> entry leaves <c>MCPFORUNITY_HAS_PHYSICS</c>
+    /// undefined; the 3D accessors are compiled out and return <c>null</c> /
     /// <c>false</c> / <see cref="SimulationMode.Unknown"/>, matching the existing
     /// fail-soft contract for missing-API cases.
     /// </summary>
@@ -92,7 +93,7 @@ namespace MCPForUnity.Runtime.Helpers
         }
 
         // ---------- Physics (3D) ----------
-#if ENABLE_PHYSICS
+#if MCPFORUNITY_HAS_PHYSICS
 
         private static PropertyInfo _physicsAutoSync;
         private static bool _physicsProbed;
